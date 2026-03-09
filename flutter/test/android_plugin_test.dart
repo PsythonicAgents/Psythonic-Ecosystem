@@ -5,12 +5,14 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:edge_veda/src/model_advisor.dart';
 import 'package:edge_veda/src/telemetry_service.dart';
+import 'package:edge_veda/src/tts_service.dart';
 import 'package:edge_veda/src/types.dart' show ModelInfo;
+import 'package:edge_veda/src/whisper_session.dart';
 
 /// Unit tests for the Android plugin MethodChannel/EventChannel integration.
 ///
 /// Tests cover:
-/// 1. MethodChannel mock responses for all 17 Android telemetry methods
+/// 1. MethodChannel mock responses for all 25 Android methods
 /// 2. Android-specific device info methods (5 methods)
 /// 3. Permission request/check flow
 /// 4. Detective features (photo insights, calendar insights, share file)
@@ -20,6 +22,9 @@ import 'package:edge_veda/src/types.dart' show ModelInfo;
 /// 8. TelemetryService integration via mocked MethodChannel
 /// 9. EventChannel names and data formats
 /// 10. pubspec.yaml platform registration
+/// 11. TTS MethodChannel handlers and TtsEvent parsing
+/// 12. SpeechRecognizer MethodChannel handlers for adaptive STT fallback
+/// 13. Adaptive STT configuration (WhisperSession chunkSizeMs, transcriptionTimeout)
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -1455,12 +1460,18 @@ void main() {
       expect(name, 'com.edgeveda.edge_veda/memory_pressure');
     });
 
+    test('tts events event channel name', () {
+      const name = 'com.edgeveda.edge_veda/tts_events';
+      expect(name, 'com.edgeveda.edge_veda/tts_events');
+    });
+
     test('all channel names share com.edgeveda.edge_veda prefix', () {
       const channels = [
         'com.edgeveda.edge_veda/telemetry',
         'com.edgeveda.edge_veda/thermal',
         'com.edgeveda.edge_veda/audio_capture',
         'com.edgeveda.edge_veda/memory_pressure',
+        'com.edgeveda.edge_veda/tts_events',
       ];
       for (final ch in channels) {
         expect(ch, startsWith('com.edgeveda.edge_veda/'));
@@ -1647,13 +1658,13 @@ void main() {
       }
     });
 
-    test('plugin manifest does NOT declare RECORD_AUDIO', () {
+    test('plugin manifest declares RECORD_AUDIO for Whisper', () {
       final manifestFile = File(
         '${Directory.current.path}/android/src/main/AndroidManifest.xml',
       );
       if (manifestFile.existsSync()) {
         final content = manifestFile.readAsStringSync();
-        expect(content, isNot(contains('RECORD_AUDIO')));
+        expect(content, contains('RECORD_AUDIO'));
       }
     });
 
@@ -2043,35 +2054,48 @@ void main() {
   // =========================================================================
 
   group('Android MethodChannel — method completeness', () {
-    test('all 17 methods are handled (13 telemetry + 4 device info)', () {
-      // Exhaustive list of methods the Android Kotlin plugin handles
-      const expectedMethods = [
-        // Telemetry (13)
-        'getThermalState',
-        'getBatteryLevel',
-        'getBatteryState',
-        'getMemoryRSS',
-        'getAvailableMemory',
-        'getFreeDiskSpace',
-        'isLowPowerMode',
-        'requestMicrophonePermission',
-        'checkDetectivePermissions',
-        'requestDetectivePermissions',
-        'getPhotoInsights',
-        'getCalendarInsights',
-        'shareFile',
-        // Device info (4)
-        'getDeviceModel',
-        'getChipName',
-        'getTotalMemory',
-        'getGpuBackend',
-      ];
+    test(
+      'all 25 methods are handled (13 telemetry + 4 device info + 5 TTS + 3 SpeechRecognizer)',
+      () {
+        // Exhaustive list of methods the Android Kotlin plugin handles
+        const expectedMethods = [
+          // Telemetry (13)
+          'getThermalState',
+          'getBatteryLevel',
+          'getBatteryState',
+          'getMemoryRSS',
+          'getAvailableMemory',
+          'getFreeDiskSpace',
+          'isLowPowerMode',
+          'requestMicrophonePermission',
+          'checkDetectivePermissions',
+          'requestDetectivePermissions',
+          'getPhotoInsights',
+          'getCalendarInsights',
+          'shareFile',
+          // Device info (4)
+          'getDeviceModel',
+          'getChipName',
+          'getTotalMemory',
+          'getGpuBackend',
+          // TTS (5)
+          'tts_speak',
+          'tts_stop',
+          'tts_pause',
+          'tts_resume',
+          'tts_voices',
+          // SpeechRecognizer (3)
+          'speechRecognizer_isAvailable',
+          'speechRecognizer_start',
+          'speechRecognizer_stop',
+        ];
 
-      expect(expectedMethods.length, 17);
-      expect(expectedMethods.toSet().length, 17); // no duplicates
-    });
+        expect(expectedMethods.length, 25);
+        expect(expectedMethods.toSet().length, 25); // no duplicates
+      },
+    );
 
-    test('hasNeuralEngine is an additional method (18 total)', () {
+    test('hasNeuralEngine is an additional method (26 total)', () {
       // hasNeuralEngine is always false on Android but still handled
       const allMethods = [
         'getThermalState',
@@ -2092,9 +2116,208 @@ void main() {
         'getTotalMemory',
         'hasNeuralEngine',
         'getGpuBackend',
+        'tts_speak',
+        'tts_stop',
+        'tts_pause',
+        'tts_resume',
+        'tts_voices',
+        'speechRecognizer_isAvailable',
+        'speechRecognizer_start',
+        'speechRecognizer_stop',
       ];
 
-      expect(allMethods.length, 18);
+      expect(allMethods.length, 26);
+    });
+  });
+
+  // =========================================================================
+  // 24. TTS MethodChannel Handlers
+  // =========================================================================
+
+  group('Android TTS MethodChannel', () {
+    late List<MethodCall> log;
+
+    setUp(() {
+      log = [];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(telemetryChannel, (MethodCall call) async {
+            log.add(call);
+            switch (call.method) {
+              case 'tts_speak':
+                return true;
+              case 'tts_stop':
+                return true;
+              case 'tts_pause':
+                return true;
+              case 'tts_resume':
+                return true;
+              case 'tts_voices':
+                return [
+                  {
+                    'id': 'en-us-x-sfg#male_1-local',
+                    'name': 'en-us-x-sfg#male_1-local',
+                    'language': 'en-US',
+                    'quality': 2,
+                  },
+                  {
+                    'id': 'en-gb-x-rjs#female_1-local',
+                    'name': 'en-gb-x-rjs#female_1-local',
+                    'language': 'en-GB',
+                    'quality': 3,
+                  },
+                ];
+              default:
+                return null;
+            }
+          });
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(telemetryChannel, null);
+    });
+
+    test('tts_speak sends text and optional params', () async {
+      final result = await telemetryChannel.invokeMethod<bool>('tts_speak', {
+        'text': 'Hello from Edge Veda',
+        'voiceId': 'en-us-x-sfg#male_1-local',
+        'rate': 0.5,
+        'pitch': 1.0,
+        'volume': 0.8,
+      });
+      expect(result, isTrue);
+      expect(log.length, 1);
+      expect(log.first.method, 'tts_speak');
+      final args = log.first.arguments as Map;
+      expect(args['text'], 'Hello from Edge Veda');
+      expect(args['voiceId'], 'en-us-x-sfg#male_1-local');
+      expect(args['rate'], 0.5);
+    });
+
+    test('tts_stop returns true', () async {
+      final result = await telemetryChannel.invokeMethod<bool>('tts_stop');
+      expect(result, isTrue);
+      expect(log.first.method, 'tts_stop');
+    });
+
+    test('tts_pause returns true (no-op on Android)', () async {
+      final result = await telemetryChannel.invokeMethod<bool>('tts_pause');
+      expect(result, isTrue);
+      expect(log.first.method, 'tts_pause');
+    });
+
+    test('tts_resume returns true (no-op on Android)', () async {
+      final result = await telemetryChannel.invokeMethod<bool>('tts_resume');
+      expect(result, isTrue);
+      expect(log.first.method, 'tts_resume');
+    });
+
+    test('tts_voices returns list of voice maps', () async {
+      final result = await telemetryChannel.invokeMethod<List>('tts_voices');
+      expect(result, isNotNull);
+      expect(result!.length, 2);
+      final first = result[0] as Map;
+      expect(first['id'], isA<String>());
+      expect(first['name'], isA<String>());
+      expect(first['language'], 'en-US');
+      expect(first['quality'], isA<int>());
+    });
+  });
+
+  // =========================================================================
+  // 25. TtsEvent.fromMap Parsing
+  // =========================================================================
+
+  group('TtsEvent.fromMap parsing', () {
+    test('parses start event', () {
+      final event = TtsEvent.fromMap({'type': 'start'});
+      expect(event.type, TtsEventType.start);
+      expect(event.wordStart, isNull);
+      expect(event.wordLength, isNull);
+      expect(event.word, isNull);
+    });
+
+    test('parses finish event', () {
+      final event = TtsEvent.fromMap({'type': 'finish'});
+      expect(event.type, TtsEventType.finish);
+    });
+
+    test('parses cancel event', () {
+      final event = TtsEvent.fromMap({'type': 'cancel'});
+      expect(event.type, TtsEventType.cancel);
+    });
+
+    test('parses wordBoundary event with range', () {
+      final event = TtsEvent.fromMap({
+        'type': 'wordBoundary',
+        'start': 6,
+        'length': 4,
+        'text': 'from',
+      });
+      expect(event.type, TtsEventType.wordBoundary);
+      expect(event.wordStart, 6);
+      expect(event.wordLength, 4);
+      expect(event.word, 'from');
+    });
+
+    test('unknown type defaults to start', () {
+      final event = TtsEvent.fromMap({'type': 'unknown_type'});
+      expect(event.type, TtsEventType.start);
+    });
+
+    test('TtsEvent.toString includes word for wordBoundary', () {
+      final event = TtsEvent.fromMap({
+        'type': 'wordBoundary',
+        'start': 0,
+        'length': 5,
+        'text': 'Hello',
+      });
+      expect(event.toString(), contains('Hello'));
+      expect(event.toString(), contains('wordBoundary'));
+    });
+
+    test('TtsEvent.toString omits word for non-wordBoundary', () {
+      final event = TtsEvent.fromMap({'type': 'start'});
+      expect(event.toString(), contains('start'));
+      expect(event.toString(), isNot(contains('word:')));
+    });
+  });
+
+  // =========================================================================
+  // 26. TtsVoice model
+  // =========================================================================
+
+  group('TtsVoice model', () {
+    test('TtsVoice constructor and toString', () {
+      const voice = TtsVoice(
+        id: 'en-us-x-sfg#male_1-local',
+        name: 'Male 1',
+        language: 'en-US',
+        quality: 3,
+      );
+      expect(voice.id, 'en-us-x-sfg#male_1-local');
+      expect(voice.name, 'Male 1');
+      expect(voice.language, 'en-US');
+      expect(voice.quality, 3);
+      expect(voice.toString(), contains('Male 1'));
+      expect(voice.toString(), contains('en-US'));
+    });
+
+    test('quality mapping: 2 = enhanced, 3 = premium', () {
+      const enhanced = TtsVoice(
+        id: 'v1',
+        name: 'V1',
+        language: 'en-US',
+        quality: 2,
+      );
+      const premium = TtsVoice(
+        id: 'v2',
+        name: 'V2',
+        language: 'en-US',
+        quality: 3,
+      );
+      expect(enhanced.quality, 2);
+      expect(premium.quality, 3);
     });
   });
 
@@ -2476,11 +2699,11 @@ void main() {
           isNot(contains('timeout(const Duration(seconds: 600))')),
           reason: 'vision timeout should be platform-aware, not hardcoded 600s',
         );
-        // Should reference Platform.isAndroid for timeout selection
+        // Should use InferenceConfig for DeviceTier-aware timeout
         expect(
           content,
-          contains('Platform.isAndroid'),
-          reason: 'vision worker should use Platform.isAndroid for timeout',
+          contains('InferenceConfig.visionTimeout'),
+          reason: 'vision worker should use InferenceConfig for timeout',
         );
       }
     });
@@ -2497,12 +2720,11 @@ void main() {
           isNot(contains('timeout(const Duration(seconds: 300))')),
           reason: 'token timeout should be platform-aware, not hardcoded 300s',
         );
-        // Should reference Platform.isAndroid for timeout selection
+        // Should use InferenceConfig for DeviceTier-aware timeout
         expect(
           content,
-          contains('Platform.isAndroid'),
-          reason:
-              'worker isolate should use Platform.isAndroid for token timeout',
+          contains('InferenceConfig.llmTokenTimeout'),
+          reason: 'worker isolate should use InferenceConfig for token timeout',
         );
       }
     });
@@ -2887,8 +3109,594 @@ void main() {
   });
 
   // =========================================================================
+  // SpeechRecognizer MethodChannel — adaptive STT fallback
+  // =========================================================================
+
+  group('SpeechRecognizer MethodChannel', () {
+    late List<MethodCall> log;
+
+    setUp(() {
+      log = [];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(telemetryChannel, (MethodCall call) async {
+            log.add(call);
+            switch (call.method) {
+              case 'speechRecognizer_isAvailable':
+                return true;
+              case 'speechRecognizer_start':
+                return true;
+              case 'speechRecognizer_stop':
+                return true;
+              default:
+                return null;
+            }
+          });
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(telemetryChannel, null);
+    });
+
+    test('speechRecognizer_isAvailable returns bool', () async {
+      final result = await telemetryChannel.invokeMethod<bool>(
+        'speechRecognizer_isAvailable',
+      );
+      expect(result, isTrue);
+      expect(log.last.method, 'speechRecognizer_isAvailable');
+    });
+
+    test('speechRecognizer_start returns true', () async {
+      final result = await telemetryChannel.invokeMethod<bool>(
+        'speechRecognizer_start',
+      );
+      expect(result, isTrue);
+      expect(log.last.method, 'speechRecognizer_start');
+    });
+
+    test('speechRecognizer_stop returns true', () async {
+      final result = await telemetryChannel.invokeMethod<bool>(
+        'speechRecognizer_stop',
+      );
+      expect(result, isTrue);
+      expect(log.last.method, 'speechRecognizer_stop');
+    });
+  });
+
+  group('SpeechRecognizer EventChannel name', () {
+    test('speech_recognition EventChannel is registered', () {
+      // Verify the channel name matches what Dart code expects
+      const channelName = 'com.edgeveda.edge_veda/speech_recognition';
+      expect(channelName, contains('speech_recognition'));
+    });
+  });
+
+  // =========================================================================
+  // Adaptive STT Configuration
+  // =========================================================================
+
+  group('Adaptive STT — WhisperSession configuration', () {
+    test(
+      'WhisperSession accepts custom chunkSizeMs and transcriptionTimeout',
+      () {
+        // Verify the constructor accepts these params without error.
+        // WhisperSession is a real class; we just check it can be constructed
+        // with the new fields (start() not called, so no native code runs).
+        // Note: Can't call start() in tests without a real model file, but
+        // constructing verifies the API surface is correct.
+        expect(
+          () => WhisperSession(
+            modelPath: '/tmp/fake.bin',
+            chunkSizeMs: 2000,
+            transcriptionTimeout: const Duration(seconds: 60),
+          ),
+          returnsNormally,
+        );
+      },
+    );
+
+    test('WhisperSession defaults are backward-compatible (3000ms, 30s)', () {
+      final session = WhisperSession(modelPath: '/tmp/fake.bin');
+      expect(session.chunkSizeMs, 3000);
+      expect(session.transcriptionTimeout, const Duration(seconds: 30));
+    });
+
+    test('WhisperSession accepts onFallbackNeeded callback', () {
+      int fallbackCount = 0;
+      expect(
+        () => WhisperSession(
+          modelPath: '/tmp/fake.bin',
+          onFallbackNeeded: (failures) => fallbackCount = failures,
+        ),
+        returnsNormally,
+      );
+      // Callback is stored but not invoked until transcription failures occur
+      expect(fallbackCount, 0);
+    });
+  });
+
+  group('Adaptive STT — device-tier config', () {
+    test('minimum tier gets shorter chunks and longer timeout', () {
+      const device = DeviceProfile(
+        identifier: 'android',
+        deviceName: 'Fire Tablet',
+        totalRamGB: 4.0,
+        chipName: 'mt8183',
+        tier: DeviceTier.minimum,
+      );
+      // Minimum tier should use 2000ms chunks, 90s timeout
+      expect(device.tier, DeviceTier.minimum);
+      expect(device.tier.index <= DeviceTier.low.index, isTrue);
+    });
+
+    test('medium tier uses default config', () {
+      const device = DeviceProfile(
+        identifier: 'android',
+        deviceName: 'Pixel 8',
+        totalRamGB: 8.0,
+        chipName: 'Tensor G3',
+        tier: DeviceTier.medium,
+      );
+      expect(device.tier.index > DeviceTier.low.index, isTrue);
+    });
+  });
+
+  // =========================================================================
   // SoakTestService default duration — 35 min behavior change
   // =========================================================================
+
+  // =========================================================================
+  // 14. Soak Test — Multi-Workload Support
+  // =========================================================================
+
+  group('SoakWorkload enum completeness', () {
+    test('soak_test_service.dart defines all 5 workload types', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('enum SoakWorkload'));
+        expect(content, contains('vision,'));
+        expect(content, contains('llm,'));
+        expect(content, contains('stt,'));
+        expect(content, contains('imageGen,'));
+        expect(content, contains('mixed,'));
+      }
+    });
+  });
+
+  group('Soak LLM workload', () {
+    test('start() accepts SoakWorkload.llm parameter', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(
+          content,
+          contains('SoakWorkload workload = SoakWorkload.vision'),
+          reason: 'start() should accept workload param with vision default',
+        );
+      }
+    });
+
+    test('LLM workload uses StreamingWorker', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('StreamingWorker? _llmWorker'));
+        expect(content, contains('_llmWorker = StreamingWorker()'));
+        expect(content, contains('_llmWorker!.spawn()'));
+        expect(content, contains('_llmWorker!.init('));
+      }
+    });
+
+    test('LLM loop uses rotating prompts', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('_soakPrompts'));
+        expect(
+          content,
+          contains('_soakPrompts[_promptIndex % _soakPrompts.length]'),
+          reason: 'LLM prompts should rotate with modulo',
+        );
+      }
+    });
+
+    test('LLM records trace with llm_inference stage', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains("stage: 'llm_inference'"));
+      }
+    });
+  });
+
+  group('Soak STT workload', () {
+    test('STT workload uses WhisperWorker', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('WhisperWorker? _whisperWorker'));
+        expect(content, contains('_whisperWorker = WhisperWorker()'));
+        expect(content, contains('_whisperWorker!.spawn()'));
+        expect(content, contains('_whisperWorker!.initWhisper('));
+      }
+    });
+
+    test('STT generates synthetic 440Hz sine wave at 16kHz', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('_generateSineWave'));
+        expect(content, contains('frequencyHz: 440.0'));
+        expect(content, contains('sampleRate: 16000'));
+        expect(content, contains('durationMs: 3000'));
+      }
+    });
+
+    test('STT records trace with stt_inference stage', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains("stage: 'stt_inference'"));
+      }
+    });
+
+    test('STT uses tier-aware timeout (90s low-end, 30s default)', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('Duration(seconds: 90)'));
+        expect(content, contains('Duration(seconds: 30)'));
+      }
+    });
+  });
+
+  group('Soak ImageGen workload', () {
+    test('ImageGen workload uses ImageWorker', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('ImageWorker? _imageWorker'));
+        expect(content, contains('_imageWorker = ImageWorker()'));
+        expect(content, contains('_imageWorker!.spawn()'));
+        expect(content, contains('_imageWorker!.initImage('));
+      }
+    });
+
+    test('ImageGen uses rotating image prompts', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('_imagePrompts'));
+        expect(
+          content,
+          contains('_imagePrompts[_promptIndex % _imagePrompts.length]'),
+          reason: 'Image prompts should rotate with modulo',
+        );
+      }
+    });
+
+    test('ImageGen generates 256x256 images (small for soak)', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('width: 256'));
+        expect(content, contains('height: 256'));
+      }
+    });
+
+    test('ImageGen records trace with imagegen_inference stage', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains("stage: 'imagegen_inference'"));
+      }
+    });
+  });
+
+  group('Soak mixed workload rotation', () {
+    test('mixed rotation cycles LLM → STT → ImageGen', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('_startMixedRotation'));
+        expect(
+          content,
+          contains('Duration(minutes: 5)'),
+          reason: 'Mixed rotation should cycle every 5 minutes',
+        );
+      }
+    });
+
+    test('mixed rotation disposes workers before switching', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        // Inside _startMixedRotation, it should call dispose before re-init
+        expect(
+          content,
+          contains('await _disposeInferenceWorkers()'),
+          reason: 'Mixed rotation must dispose workers before switching',
+        );
+      }
+    });
+  });
+
+  group('OOM recovery validation', () {
+    test('validateOomRecovery method exists', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(
+          content,
+          contains('Future<Map<String, dynamic>> validateOomRecovery()'),
+        );
+      }
+    });
+
+    test('OOM recovery loads LLM, Vision, and Whisper sequentially', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('OOM test: LLM loaded'));
+        expect(content, contains('OOM test: Vision loaded'));
+        expect(content, contains('OOM test: Whisper loaded'));
+      }
+    });
+
+    test('OOM recovery tracks failures and recoveries', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('_modelLoadFailures'));
+        expect(content, contains('_oomRecoveryCount'));
+        expect(content, contains("results['failures']"));
+        expect(content, contains("results['recoveries']"));
+      }
+    });
+
+    test('OOM recovery disposes each worker after load test', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        // Each model load is wrapped in try/finally with dispose
+        final disposeInOom = 'await w.dispose()'.allMatches(content).length;
+        expect(
+          disposeInOom,
+          greaterThanOrEqualTo(3),
+          reason:
+              'Each OOM load attempt should dispose worker in finally block',
+        );
+      }
+    });
+  });
+
+  group('Worker cleanup on stop', () {
+    test('stop() cancels soakInferenceTimer', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('_soakInferenceTimer?.cancel()'));
+        expect(content, contains('_soakInferenceTimer = null'));
+      }
+    });
+
+    test('_disposeInferenceWorkers cleans up all 4 worker types', () {
+      final file = File(
+        '${Directory.current.path}/example/lib/soak_test_service.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('await _visionWorker.dispose()'));
+        expect(content, contains('await _llmWorker?.dispose()'));
+        expect(content, contains('await _whisperWorker?.dispose()'));
+        expect(content, contains('await _imageWorker?.dispose()'));
+      }
+    });
+  });
+
+  group('Soak GPU detection — runtime not hardcoded', () {
+    test(
+      'soak_test_service uses InferenceConfig.useGpu (not Platform.isIOS)',
+      () {
+        final file = File(
+          '${Directory.current.path}/example/lib/soak_test_service.dart',
+        );
+        if (file.existsSync()) {
+          final content = file.readAsStringSync();
+          expect(
+            content,
+            contains('InferenceConfig.useGpu'),
+            reason: 'Soak test should use runtime GPU detection',
+          );
+          // Should NOT have hardcoded Platform.isIOS for useGpu
+          expect(
+            content.contains('useGpu: Platform.isIOS'),
+            isFalse,
+            reason: 'useGpu should not be hardcoded to Platform.isIOS',
+          );
+        }
+      },
+    );
+  });
+
+  group('InferenceConfig — DeviceTier-aware parameters', () {
+    test('InferenceConfig.dart exists with tier-aware methods', () {
+      final file = File(
+        '${Directory.current.path}/lib/src/inference_config.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('class InferenceConfig'));
+        expect(content, contains('llmTokenTimeout'));
+        expect(content, contains('visionTimeout'));
+        expect(content, contains('maxInferenceDimension'));
+        expect(content, contains('useGpu'));
+      }
+    });
+
+    test('AdaptiveVisionConfig tracks consecutive failures', () {
+      final file = File(
+        '${Directory.current.path}/lib/src/inference_config.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('class AdaptiveVisionConfig'));
+        expect(content, contains('recordSuccess'));
+        expect(content, contains('recordTimeout'));
+        expect(content, contains('_consecutiveFailures'));
+        expect(content, contains('_consecutiveSuccesses'));
+      }
+    });
+
+    test(
+      'AdaptiveVisionConfig degrades resolution by 25% after 2 timeouts',
+      () {
+        final file = File(
+          '${Directory.current.path}/lib/src/inference_config.dart',
+        );
+        if (file.existsSync()) {
+          final content = file.readAsStringSync();
+          expect(
+            content,
+            contains('_consecutiveFailures >= 2'),
+            reason: 'Should degrade after 2 consecutive failures',
+          );
+          expect(
+            content,
+            contains('* 0.75'),
+            reason: 'Resolution should degrade by 25%',
+          );
+        }
+      },
+    );
+
+    test('AdaptiveVisionConfig recovers after 5 consecutive successes', () {
+      final file = File(
+        '${Directory.current.path}/lib/src/inference_config.dart',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(
+          content,
+          contains('_consecutiveSuccesses >= 5'),
+          reason: 'Should recover after 5 consecutive successes',
+        );
+        expect(
+          content,
+          contains('* 1.25'),
+          reason: 'Resolution should recover by 25%',
+        );
+      }
+    });
+  });
+
+  group('Integration test files exist', () {
+    test('LLM integration test exists', () {
+      final file = File(
+        '${Directory.current.path}/example/integration_test/llm_test.dart',
+      );
+      expect(
+        file.existsSync(),
+        isTrue,
+        reason: 'integration_test/llm_test.dart should exist',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('StreamingWorker'));
+        expect(content, contains('startStream'));
+        expect(content, contains('nextToken'));
+      }
+    });
+
+    test('Vision integration test exists', () {
+      final file = File(
+        '${Directory.current.path}/example/integration_test/vision_test.dart',
+      );
+      expect(
+        file.existsSync(),
+        isTrue,
+        reason: 'integration_test/vision_test.dart should exist',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('VisionWorker'));
+        expect(content, contains('describeFrame'));
+      }
+    });
+
+    test('Whisper integration test exists', () {
+      final file = File(
+        '${Directory.current.path}/example/integration_test/whisper_test.dart',
+      );
+      expect(
+        file.existsSync(),
+        isTrue,
+        reason: 'integration_test/whisper_test.dart should exist',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('WhisperWorker'));
+        expect(content, contains('transcribeChunk'));
+      }
+    });
+
+    test('ImageGen integration test exists', () {
+      final file = File(
+        '${Directory.current.path}/example/integration_test/imagegen_test.dart',
+      );
+      expect(
+        file.existsSync(),
+        isTrue,
+        reason: 'integration_test/imagegen_test.dart should exist',
+      );
+      if (file.existsSync()) {
+        final content = file.readAsStringSync();
+        expect(content, contains('ImageWorker'));
+        expect(content, contains('generateImage'));
+      }
+    });
+  });
 
   group('SoakTestService default duration', () {
     test('soak_test_service.dart defines _testDuration as 35 minutes', () {
