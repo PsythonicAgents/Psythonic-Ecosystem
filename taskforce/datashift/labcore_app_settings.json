@@ -1,0 +1,84 @@
+{
+  "projectName": "labcore",
+  "environment": "development",
+  "version": "1.1.0",
+
+  "paths": {
+    "root": ".",
+    "dataDir": "./data",
+    "logsDir": "./logs",
+    "tempDir": "./.tmp"
+  },
+
+  "logging": {
+    "level": "debug",
+    "destinations": ["console", "file"],
+    "filePath": "./logs/labcore.log",
+    "rotation": {
+      "enabled": true,
+      "maxSizeMB": 10,
+      "maxFiles": 7
+    },
+    "console": {
+      "pretty": true,
+      "timestamps": true
+    }
+  },
+
+  "features": {
+    "enableDiagnostics": true,
+    "enableRealTimeAlerts": false,
+    "enableTelemetry": true
+  },
+
+  "telemetry": {
+    "enabled": true,
+    "provider": "none",
+    "anonymizeIPs": true
+  },
+
+  "security": {
+    "allowlistCIDRs": [],
+    "redactFields": ["apiKey", "password", "secret"],
+    "cors": {
+      "enabled": true,
+      "origins": ["*"]
+    }
+  },
+
+  "limits": {
+    "maxConcurrentJobs": 4,
+    "requestTimeoutMs": 15000
+  },
+
+  "retryPolicy": {
+    "retries": 2,
+    "backoffMs": 500
+  },
+
+  "diagnostics": {
+    "reportIntervalSeconds": 60,
+    "includeSystemMetrics": true
+  },
+
+  "realTimeAlerts": {
+    "enabled": false,
+    "channels": [],
+    "throttleSeconds": 30
+  },
+
+  "audit": {
+    "enabled": true,
+    "retainDays": 14
+  },
+
+  "validators": {
+    "schemaUrl": "https://schema.example.com/labcore/config.json",
+    "strict": true
+  },
+
+  "metadata": {
+    "updatedAt": "2025-09-25T00:00:00Z",
+    "createdBy": "system"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "experimentId": "exp-001",
+  "createdAt": "2025-09-25T12:00:00Z",
+  "updatedAt": "2025-09-25T12:00:00Z",
+  "description": "Volatility scan for SOL token over a 60-minute window.",
+  "version": "1.2.0",
+
+  "parameters": {
+    "tokenSymbol": "SOL",
+    "analysisWindowMinutes": 60,
+    "volatilityThreshold": 0.05,
+    "dataSource": "https://data.solanatracker.io",
+    "samplingIntervalSeconds": 30,
+    "maxDataPoints": 2000,
+    "includeOutliers": false
+  },
+
+  "status": "completed",
+  "results": {
+    "volatility": 0.072,
+    "exceedsThreshold": true,
+    "anomaliesDetected": 3,
+    "patterns": [
+      {
+        "type": "VolumeSpike",
+        "startIndex": 120,
+        "endIndex": 140,
+        "average": 10832.5,
+        "peakValue": 15200.9,
+        "durationSeconds": 600
+      }
+    ],
+    "summary": {
+      "mean": 0.048,
+      "median": 0.045,
+      "stdDev": 0.012,
+      "maxObserved": 0.082
+    }
+  },
+
+  "diagnostics": {
+    "systemLoad": 0.42,
+    "memoryUsageMB": 256,
+    "latencyMs": 120
+  },
+
+  "notes": "Detected volatility exceeded threshold mainly due to high activity in the mid-session.",
+  "tags": ["volatility", "token-analysis", "patterns"],
+
+  "audit": {
+    "validatedBy": "system-checker",
+    "checksum": "ab34d9f1e7c9f8ac",
+    "integrity": "verified"
+  },
+
+  "metadata": {
+    "owner": "analysis-engine",
+    "reviewed": true
+  }
+}
